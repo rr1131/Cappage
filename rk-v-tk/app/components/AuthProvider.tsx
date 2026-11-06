@@ -21,7 +21,10 @@ export default function AuthProvider({
   children: React.ReactNode;
 }) {
   return (
-    <Authenticator>
+    <Authenticator
+      loginMechanisms={["username"]}
+      signUpAttributes={["email"]}
+    >
       {({ user, signOut }) => (
         <div>
           <header>
