@@ -1,0 +1,500 @@
+{
+  "id": "5b28aafc-2dc5-4c03-a117-ff81392b11cd",
+  "prevId": "acfd8af5-e0f8-40bd-86f8-e0978382d49f",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "public.users": {
+      "name": "users",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "cognito_sub": {
+          "name": "cognito_sub",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "username": {
+          "name": "username",
+          "type": "varchar(30)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "display_name": {
+          "name": "display_name",
+          "type": "varchar(80)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "users_cognito_sub_unique": {
+          "name": "users_cognito_sub_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "cognito_sub"
+          ]
+        },
+        "users_username_unique": {
+          "name": "users_username_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "username"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "users_username_format": {
+          "name": "users_username_format",
+          "value": "\"users\".\"username\" ~ '^[a-z0-9_]{3,30}$'"
+        },
+        "users_cognito_sub_nonempty": {
+          "name": "users_cognito_sub_nonempty",
+          "value": "length(trim(\"users\".\"cognito_sub\")) > 0"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.nfl_current_odds": {
+      "name": "nfl_current_odds",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "provider": {
+          "name": "provider",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "game_id": {
+          "name": "game_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "bookmaker": {
+          "name": "bookmaker",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "market": {
+          "name": "market",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "selection": {
+          "name": "selection",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "point": {
+          "name": "point",
+          "type": "numeric(7, 2)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "american_odds": {
+          "name": "american_odds",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provider_updated_at": {
+          "name": "provider_updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "ingested_at": {
+          "name": "ingested_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "available": {
+          "name": "available",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": true
+        },
+        "revision": {
+          "name": "revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "nfl_current_odds_provider_game_id_nfl_game_provider_ids_provider_game_id_fk": {
+          "name": "nfl_current_odds_provider_game_id_nfl_game_provider_ids_provider_game_id_fk",
+          "tableFrom": "nfl_current_odds",
+          "tableTo": "nfl_game_provider_ids",
+          "columnsFrom": [
+            "provider",
+            "game_id"
+          ],
+          "columnsTo": [
+            "provider",
+            "game_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "nfl_odds_slot_unique": {
+          "name": "nfl_odds_slot_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "provider",
+            "game_id",
+            "bookmaker",
+            "market",
+            "selection"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "nfl_odds_book": {
+          "name": "nfl_odds_book",
+          "value": "\"nfl_current_odds\".\"bookmaker\" IN ('draftkings', 'fanduel')"
+        },
+        "nfl_odds_price": {
+          "name": "nfl_odds_price",
+          "value": "\"nfl_current_odds\".\"american_odds\" <= -100 OR \"nfl_current_odds\".\"american_odds\" >= 100"
+        },
+        "nfl_odds_revision": {
+          "name": "nfl_odds_revision",
+          "value": "\"nfl_current_odds\".\"revision\" > 0"
+        },
+        "nfl_odds_selection": {
+          "name": "nfl_odds_selection",
+          "value": "(\n    (\"nfl_current_odds\".\"market\" = 'h2h' AND \"nfl_current_odds\".\"selection\" IN ('home', 'away') AND \"nfl_current_odds\".\"point\" IS NULL) OR\n    (\"nfl_current_odds\".\"market\" = 'spreads' AND \"nfl_current_odds\".\"selection\" IN ('home', 'away') AND \"nfl_current_odds\".\"point\" IS NOT NULL) OR\n    (\"nfl_current_odds\".\"market\" = 'totals' AND \"nfl_current_odds\".\"selection\" IN ('over', 'under') AND \"nfl_current_odds\".\"point\" > 0)\n  )"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.nfl_game_provider_ids": {
+      "name": "nfl_game_provider_ids",
+      "schema": "",
+      "columns": {
+        "provider": {
+          "name": "provider",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provider_event_id": {
+          "name": "provider_event_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "game_id": {
+          "name": "game_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "nfl_game_provider_ids_game_id_nfl_games_id_fk": {
+          "name": "nfl_game_provider_ids_game_id_nfl_games_id_fk",
+          "tableFrom": "nfl_game_provider_ids",
+          "tableTo": "nfl_games",
+          "columnsFrom": [
+            "game_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "nfl_game_provider_ids_provider_provider_event_id_pk": {
+          "name": "nfl_game_provider_ids_provider_provider_event_id_pk",
+          "columns": [
+            "provider",
+            "provider_event_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {
+        "nfl_game_provider_game_unique": {
+          "name": "nfl_game_provider_game_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "provider",
+            "game_id"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "nfl_game_provider_name": {
+          "name": "nfl_game_provider_name",
+          "value": "\"nfl_game_provider_ids\".\"provider\" IN ('mock', 'the-odds-api')"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.nfl_games": {
+      "name": "nfl_games",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "home_team_id": {
+          "name": "home_team_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "away_team_id": {
+          "name": "away_team_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "starts_at": {
+          "name": "starts_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'scheduled'"
+        },
+        "season_year": {
+          "name": "season_year",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "season_source": {
+          "name": "season_source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'derived'"
+        },
+        "last_seen_at": {
+          "name": "last_seen_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "nfl_games_start_idx": {
+          "name": "nfl_games_start_idx",
+          "columns": [
+            {
+              "expression": "starts_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "nfl_games_distinct_teams": {
+          "name": "nfl_games_distinct_teams",
+          "value": "\"nfl_games\".\"home_team_id\" <> \"nfl_games\".\"away_team_id\""
+        },
+        "nfl_games_status": {
+          "name": "nfl_games_status",
+          "value": "\"nfl_games\".\"status\" IN ('scheduled', 'unavailable')"
+        },
+        "nfl_games_season_source": {
+          "name": "nfl_games_season_source",
+          "value": "\"nfl_games\".\"season_source\" = 'derived'"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.odds_sync_state": {
+      "name": "odds_sync_state",
+      "schema": "",
+      "columns": {
+        "provider": {
+          "name": "provider",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "lease_token": {
+          "name": "lease_token",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "lease_until": {
+          "name": "lease_until",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_attempt_at": {
+          "name": "last_attempt_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_success_at": {
+          "name": "last_success_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "snapshot_at": {
+          "name": "snapshot_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "next_refresh_at": {
+          "name": "next_refresh_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "failures": {
+          "name": "failures",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "last_error": {
+          "name": "last_error",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "quota_remaining": {
+          "name": "quota_remaining",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "quota_used": {
+          "name": "quota_used",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "quota_last_cost": {
+          "name": "quota_last_cost",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "warnings_count": {
+          "name": "warnings_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "odds_sync_provider_name": {
+          "name": "odds_sync_provider_name",
+          "value": "\"odds_sync_state\".\"provider\" IN ('mock', 'the-odds-api')"
+        }
+      },
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {},
+  "schemas": {},
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}

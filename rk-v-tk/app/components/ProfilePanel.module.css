@@ -1,0 +1,28 @@
+.panel {
+  display: grid;
+  gap: 1rem;
+  max-width: 32rem;
+  margin: 2rem 0;
+  padding: 1.5rem;
+  border: 1px solid currentColor;
+  border-radius: 0.5rem;
+}
+
+.form {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.panel input,
+.panel button {
+  padding: 0.75rem;
+  font: inherit;
+}
+
+.panel button {
+  cursor: pointer;
+}
+
+.panel button:disabled {
+  cursor: wait;
+}

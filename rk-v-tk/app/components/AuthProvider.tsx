@@ -26,7 +26,7 @@ export default function AuthProvider({
       signUpAttributes={["email"]}
     >
       {({ user, signOut }) => (
-        <div>
+        <div key={user?.userId}>
           <header>
             <p>Signed in as {user?.username}</p>
             <button onClick={signOut}>Sign out</button>
