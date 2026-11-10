@@ -15,6 +15,13 @@
       "when": 1794324223361,
       "tag": "0001_nfl_odds",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794338141481,
+      "tag": "0002_odds_cost_controls",
+      "breakpoints": true
     }
   ]
 }

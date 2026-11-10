@@ -2,12 +2,14 @@ import "server-only";
 import { ProfileError } from "../domain/profile";
 import type { oddsRepository } from "./repository";
 import { OddsError } from "./errors";
+import type { syncOdds } from "./sync";
 
 type Repository = ReturnType<typeof oddsRepository>;
 type Dependencies = {
   authenticate: (request: Request) => Promise<string>;
   listGames: (now: Date, days: number) => ReturnType<Repository["listGames"]>;
   gameOdds: (gameId: string, now: Date) => ReturnType<Repository["gameOdds"]>;
+  refresh: () => ReturnType<typeof syncOdds>;
   clock?: () => Date;
 };
 function json(body: unknown, status = 200) {
@@ -23,6 +25,15 @@ const invalid = () => new OddsError("INVALID_PARAMETERS", "Provide valid NFL gam
 
 export function oddsHandlers(deps: Dependencies) {
   return {
+    async refresh(request: Request) {
+      try {
+        await deps.authenticate(request);
+        // The browser expresses demand only. Provider selection, budgets,
+        // identity, and timestamps are entirely server controlled.
+        if (request.method !== "POST" || new URL(request.url).search || request.body !== null) throw invalid();
+        return json(await deps.refresh());
+      } catch (error) { return failure(error); }
+    },
     async games(request: Request) {
       try {
         await deps.authenticate(request);

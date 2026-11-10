@@ -33,6 +33,49 @@ describe("Amplify runtime environment export", () => {
     expect(() => execFileSync(process.execPath, [script], { cwd: directory, env: { NODE_ENV: "production" }, stdio: "pipe" })).toThrow();
     expect(existsSync(join(directory, ".env.production"))).toBe(false);
   });
+  it("exports the server-only odds budget settings without exposing unrelated values", () => {
+    const odds = {
+      ODDS_PROVIDER: "the-odds-api",
+      ODDS_API_KEY: "test-key-with-$-literal",
+      ODDS_REFRESH_SECONDS: "21600",
+      ODDS_FRESH_SECONDS: "300",
+      ODDS_MAX_AGE_SECONDS: "86400",
+      ODDS_CREDIT_RESERVE: "25",
+      ODDS_MONTHLY_CREDIT_CAP: "300",
+      ODDS_DAILY_PAID_REFRESH_LIMIT: "3",
+      // Fixture only; this is not a verified provider reset time.
+      ODDS_BILLING_ANCHOR: "2026-11-01T08:00:00Z",
+    };
+    const output = execFileSync(process.execPath, [script], {
+      cwd: directory, env: { ...settings, ...odds, NEXT_PUBLIC_ODDS_API_KEY: "must-not-export" }, encoding: "utf8",
+    });
+    expect(output).toBe("");
+    const contents = readFileSync(join(directory, ".env.production"), "utf8");
+    expect(contents).not.toContain("must-not-export");
+    expect(contents).not.toContain("NEXT_PUBLIC_ODDS");
+    const loaded = execFileSync(process.execPath, ["-e",
+      "require(process.argv[1]).loadEnvConfig(process.cwd(), false); process.stdout.write(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith('ODDS_')))))", nextEnv,
+    ], { cwd: directory, env: { NODE_ENV: "production" }, encoding: "utf8" });
+    expect(JSON.parse(loaded)).toEqual(odds);
+    expect(contents).toContain(`NEXT_PUBLIC_COGNITO_USER_POOL_ID="${settings.NEXT_PUBLIC_COGNITO_USER_POOL_ID}"`);
+    expect(contents).toContain(`NEXT_PUBLIC_COGNITO_CLIENT_ID="${settings.NEXT_PUBLIC_COGNITO_CLIENT_ID}"`);
+  });
+  it.each(["ODDS_BILLING_ANCHOR", "ODDS_MONTHLY_CREDIT_CAP", "ODDS_DAILY_PAID_REFRESH_LIMIT"])(
+    "rejects dotenv injection in %s before writing or echoing its value", (key) => {
+      try {
+        execFileSync(process.execPath, [script], {
+          cwd: directory, env: { ...settings, [key]: "sensitive-value\nNEXT_PUBLIC_LEAK=secret" }, stdio: "pipe",
+        });
+        expect.fail("Expected invalid setting to fail");
+      } catch (error) {
+        const stderr = String((error as { stderr: Buffer }).stderr);
+        expect(stderr).toContain(key);
+        expect(stderr).not.toContain("sensitive-value");
+        expect(stderr).not.toContain("NEXT_PUBLIC_LEAK");
+        expect(existsSync(join(directory, ".env.production"))).toBe(false);
+      }
+    },
+  );
   it("rejects newline injection without echoing the secret value", () => {
     try {
       execFileSync(process.execPath, [script], {

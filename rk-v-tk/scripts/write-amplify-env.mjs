@@ -4,7 +4,8 @@ import { writeFileSync } from "node:fs";
 // environment: only these explicit keys are allowed into the SSR artifact.
 const required = ["DATABASE_URL", "NEXT_PUBLIC_COGNITO_USER_POOL_ID", "NEXT_PUBLIC_COGNITO_CLIENT_ID"];
 const optional = ["COGNITO_USER_POOL_ID", "COGNITO_CLIENT_ID", "ODDS_PROVIDER", "ODDS_API_KEY",
-  "ODDS_REFRESH_SECONDS", "ODDS_FRESH_SECONDS", "ODDS_MAX_AGE_SECONDS", "ODDS_CREDIT_RESERVE"];
+  "ODDS_REFRESH_SECONDS", "ODDS_FRESH_SECONDS", "ODDS_MAX_AGE_SECONDS", "ODDS_CREDIT_RESERVE",
+  "ODDS_MONTHLY_CREDIT_CAP", "ODDS_DAILY_PAID_REFRESH_LIMIT", "ODDS_BILLING_ANCHOR"];
 for (const key of required) {
   if (!process.env[key]) throw new Error(`Missing required Amplify setting: ${key}`);
 }

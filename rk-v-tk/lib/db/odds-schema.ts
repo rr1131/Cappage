@@ -43,6 +43,7 @@ export const nflCurrentOdds = pgTable("nfl_current_odds", {
   providerUpdatedAt: time("provider_updated_at").notNull(),
   ingestedAt: time("ingested_at").notNull(),
   available: boolean("available").default(true).notNull(),
+  unavailableAt: time("unavailable_at"),
   revision: integer("revision").default(1).notNull(),
 }, (t) => [
   unique("nfl_odds_slot_unique").on(t.provider, t.gameId, t.bookmaker, t.market, t.selection),
@@ -72,3 +73,39 @@ export const oddsSyncState = pgTable("odds_sync_state", {
   quotaLastCost: integer("quota_last_cost"),
   warningsCount: integer("warnings_count").default(0).notNull(),
 }, (t) => [check("odds_sync_provider_name", sql`${t.provider} IN ('mock', 'the-odds-api')`)]);
+
+// One shared account budget. Every instance using this API allocation must use
+// this database. Limits can be tightened by runtime config, never silently raised.
+export const oddsProviderBudget = pgTable("odds_provider_budget", {
+  provider: text("provider").primaryKey(),
+  billingAnchor: time("billing_anchor").notNull(),
+  periodStart: time("period_start").notNull(),
+  periodEnd: time("period_end").notNull(),
+  creditsCharged: integer("credits_charged").default(0).notNull(),
+  monthlyCreditCap: integer("monthly_credit_cap").notNull(),
+  dailyPaidRefreshLimit: integer("daily_paid_refresh_limit").notNull(),
+  day: text("day").notNull(),
+  dailyPaidRefreshes: integer("daily_paid_refreshes").default(0).notNull(),
+  nextPaidAttemptAt: time("next_paid_attempt_at"),
+}, (t) => [
+  check("odds_budget_provider", sql`${t.provider} = 'the-odds-api'`),
+  check("odds_budget_limits", sql`${t.monthlyCreditCap} BETWEEN 0 AND 300 AND ${t.dailyPaidRefreshLimit} BETWEEN 0 AND 3`),
+  check("odds_budget_counts", sql`${t.creditsCharged} >= 0 AND ${t.dailyPaidRefreshes} BETWEEN 0 AND 3`),
+  check("odds_budget_period", sql`${t.periodStart} < ${t.periodEnd}`),
+]);
+
+export const oddsProviderRequests = pgTable("odds_provider_requests", {
+  id: uuid("id").primaryKey(),
+  provider: text("provider").notNull().references(() => oddsProviderBudget.provider),
+  periodStart: time("period_start").notNull(),
+  day: text("day").notNull(),
+  requestedAt: time("requested_at").notNull(),
+  chargedCredits: integer("charged_credits").default(3).notNull(),
+  status: text("status", { enum: ["uncertain", "confirmed"] }).default("uncertain").notNull(),
+  confirmedAt: time("confirmed_at"),
+  providerUsed: integer("provider_used"),
+}, (t) => [
+  index("odds_requests_period_idx").on(t.provider, t.periodStart),
+  check("odds_request_cost", sql`${t.chargedCredits} BETWEEN 0 AND 3`),
+  check("odds_request_status", sql`${t.status} IN ('uncertain', 'confirmed')`),
+]);

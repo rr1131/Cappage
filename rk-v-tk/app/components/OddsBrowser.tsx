@@ -77,12 +77,12 @@ function formatTime(value: string, kickoff = false) {
 
 function signed(value: number) { return value > 0 ? `+${value}` : String(value); }
 
-async function getOddsData<T>(path: string, signal: AbortSignal): Promise<T> {
+async function getOddsData<T>(path: string, signal: AbortSignal, method = "GET"): Promise<T> {
   const { tokens } = await fetchAuthSession();
   if (signal.aborted) throw new DOMException("Request cancelled", "AbortError");
   if (!tokens?.accessToken) throw new Error("Sign in again to browse NFL odds.");
   const response = await fetch(path, {
-    signal, cache: "no-store", headers: { Authorization: `Bearer ${tokens.accessToken.toString()}` },
+    method, signal, cache: "no-store", headers: { Authorization: `Bearer ${tokens.accessToken.toString()}` },
   });
   const data = await response.json().catch(() => {
     throw new Error("The odds service is temporarily unavailable. Please try again.");
@@ -135,6 +135,8 @@ export default function OddsBrowser() {
   const [oddsError, setOddsError] = useState("");
   const [market, setMarket] = useState<Market>("h2h");
   const [refresh, setRefresh] = useState(0);
+  const [oddsRefresh, setOddsRefresh] = useState(0);
+  const [refreshError, setRefreshError] = useState("");
   const [now, setNow] = useState(() => Date.now());
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
@@ -158,11 +160,24 @@ export default function OddsBrowser() {
     const controller = new AbortController();
     setGamesLoading(true);
     setGamesError("");
-    getOddsData<GamesResponse>("/api/nfl/games", controller.signal).then((data) => {
+    setRefreshError("");
+    // Demand is expressed once on entry or a deliberate refresh. Even when an
+    // update fails, the last successful shared cache remains available to read.
+    const loadGames = async () => {
+      try {
+        await getOddsData("/api/nfl/refresh", controller.signal, "POST");
+      } catch (error) {
+        if (controller.signal.aborted) throw error;
+        setRefreshError("The latest odds update is unavailable. Showing stored prices where available.");
+      }
+      return getOddsData<GamesResponse>("/api/nfl/games", controller.signal);
+    };
+    loadGames().then((data) => {
       if (controller.signal.aborted) return;
       const sorted = [...data.games].sort((a, b) => Date.parse(a.startsAt) - Date.parse(b.startsAt));
       setGamesData({ ...data, games: sorted });
       setSelectedGameId((current) => sorted.some((game) => game.id === current) ? current : sorted[0]?.id ?? null);
+      setOddsRefresh((value) => value + 1);
       setNow(Date.now());
     }).catch((error: unknown) => {
       if (!controller.signal.aborted) setGamesError(errorMessage(error));
@@ -171,7 +186,7 @@ export default function OddsBrowser() {
   }, [refresh]);
 
   useEffect(() => {
-    if (!selectedGameId) {
+    if (!selectedGameId || gamesLoading) {
       setOddsData(null);
       setOddsLoading(false);
       setOddsError("");
@@ -187,7 +202,7 @@ export default function OddsBrowser() {
       if (!controller.signal.aborted) setOddsError(errorMessage(error));
     }).finally(() => { if (!controller.signal.aborted) setOddsLoading(false); });
     return () => controller.abort();
-  }, [selectedGameId, refresh]);
+  }, [selectedGameId, oddsRefresh, gamesLoading]);
 
   const selectedGame = gamesData?.games.find((game) => game.id === selectedGameId);
   const selectedMarket = markets.find((entry) => entry.key === market)!;
@@ -217,9 +232,11 @@ export default function OddsBrowser() {
         </div>
         <button className={styles.refreshButton} type="button" disabled={gamesLoading || oddsLoading}
           onClick={() => setRefresh((value) => value + 1)}>
-          {gamesLoading ? "Loading…" : "Refresh view"}
+          {gamesLoading ? "Loading…" : "Refresh odds"}
         </button>
       </header>
+
+      {refreshError && <p className={styles.notice} role="status">{refreshError}</p>}
 
       {meta && (
         <div className={styles.feedInfo}>

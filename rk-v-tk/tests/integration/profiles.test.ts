@@ -1,36 +1,21 @@
-import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { Pool } from "pg";
-import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
+import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { profileRepository } from "../../lib/profiles/repository";
 import { profileHandlers } from "../../lib/profiles/http";
 import * as schema from "../../lib/db/schema";
+import { disposablePostgres } from "../helpers/postgres";
 
-const connectionString = process.env.TEST_DATABASE_URL;
-if (!connectionString || !new URL(connectionString).pathname.endsWith("_test")) {
-  throw new Error("Set TEST_DATABASE_URL to a separate PostgreSQL database with a name ending in _test. Integration tests never use DATABASE_URL.");
-}
-if (connectionString === process.env.DATABASE_URL) throw new Error("Test and application databases must be separate.");
-
-const testSchema = `profile_test_${randomUUID().replaceAll("-", "")}`;
-const admin = new Pool({ connectionString, max: 1 });
-const pool = new Pool({ connectionString, max: 12, options: `-c search_path=${testSchema}` });
-let db: NodePgDatabase<typeof schema>;
-let repository: ReturnType<typeof profileRepository>;
+const postgres = disposablePostgres();
+const { db, pool, connectionString } = postgres;
+const repository = profileRepository(db);
 
 beforeAll(async () => {
-  await admin.query(`CREATE SCHEMA "${testSchema}"`);
-  db = drizzle(pool, { schema });
-  await migrate(db, { migrationsFolder: "./drizzle", migrationsSchema: testSchema });
-  repository = profileRepository(db);
+  await postgres.initialize();
 });
 beforeEach(async () => { await pool.query('TRUNCATE TABLE "users"'); });
-afterAll(async () => {
-  await pool.end();
-  try { await admin.query(`DROP SCHEMA IF EXISTS "${testSchema}" CASCADE`); }
-  finally { await admin.end(); }
-});
+afterAll(() => postgres.close());
 
 describe("PostgreSQL profile persistence", () => {
   it("persists generated IDs and UTC timestamps across connections", async () => {
@@ -39,7 +24,7 @@ describe("PostgreSQL profile persistence", () => {
     expect(result.profile.id).toMatch(/^[a-f0-9-]{36}$/);
     expect(result.profile.createdAt).toMatch(/Z$/);
     expect(result.profile.updatedAt).toBe(result.profile.createdAt);
-    const fresh = new Pool({ connectionString, options: `-c search_path=${testSchema}` });
+    const fresh = new Pool({ connectionString });
     try {
       expect(await profileRepository(drizzle(fresh, { schema })).findBySubject("subject-a")).toEqual(result.profile);
     } finally { await fresh.end(); }
@@ -120,7 +105,7 @@ describe("PostgreSQL profile persistence", () => {
 
   it("can reapply the migration runner without changing stored profiles", async () => {
     const first = await repository.create("subject-a", { username: "rod", displayName: null });
-    await migrate(db, { migrationsFolder: "./drizzle", migrationsSchema: testSchema });
+    await migrate(db, { migrationsFolder: "./drizzle" });
     expect(await repository.findBySubject("subject-a")).toEqual(first.profile);
   });
 });

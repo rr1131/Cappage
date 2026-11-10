@@ -4,7 +4,7 @@ import { isAmericanOdds, nflSeasonYear, type Bookmaker, type Market, type Provid
   type ProviderQuota, type ProviderQuote, type ProviderSnapshot, type Selection } from "../domain/odds";
 import { resolveTeam } from "../domain/nfl-teams";
 import { easternWindowEnd } from "../domain/odds-window";
-import type { OddsProvider } from "./odds-provider";
+import type { OddsProvider, PaidRequestGuard } from "./odds-provider";
 import { ProviderError } from "./provider-error";
 
 type ObjectValue = Record<string, unknown>;
@@ -237,7 +237,7 @@ export class TheOddsApiProvider implements OddsProvider {
     } finally { clearTimeout(timer); }
   }
 
-  async fetchSnapshot(now: Date): Promise<ProviderSnapshot> {
+  async fetchSnapshot(now: Date, guard?: PaidRequestGuard): Promise<ProviderSnapshot> {
     if (!Number.isFinite(now.getTime())) throw new ProviderError("PROVIDER_CONFIGURATION");
     const events = await this.request("events", now);
     const schedule = normalizeTheOddsApiResponse(events.data, [], now, events.quota);
@@ -246,7 +246,17 @@ export class TheOddsApiProvider implements OddsProvider {
     // when the provider billing period resets. No paid request with unknown quota.
     if (events.quota.remaining === null) throw new ProviderError("PROVIDER_INVALID_RESPONSE");
     if (events.quota.remaining < this.creditReserve + 3) throw new ProviderError("PROVIDER_QUOTA_EXHAUSTED");
+    // Never rely on an instance-local lock or the provider's remaining header
+    // alone: all callers must reserve the worst-case cost in shared PostgreSQL.
+    if (!guard) throw new ProviderError("PROVIDER_CONFIGURATION");
+    await guard.beforePaidRequest(events.quota);
     const odds = await this.request("odds", now);
-    return normalizeTheOddsApiResponse(events.data, odds.data, now, odds.quota);
+    const snapshot = normalizeTheOddsApiResponse(events.data, odds.data, now, odds.quota);
+    // Network, parsing, and normalization failures intentionally leave the
+    // reservation charged. There is no inline retry of an uncertain paid call.
+    if (odds.quota.lastCost !== null && odds.quota.lastCost <= 3) {
+      await guard.afterPaidResponse(odds.quota);
+    }
+    return snapshot;
   }
 }

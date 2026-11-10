@@ -1,25 +1,15 @@
-import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { Pool } from "pg";
-import { drizzle } from "drizzle-orm/node-postgres";
-import { migrate } from "drizzle-orm/node-postgres/migrator";
-import * as schema from "../../lib/db/schema";
 import type { ProviderName, ProviderSnapshot } from "../../lib/domain/odds";
 import { oddsRepository } from "../../lib/odds/repository";
 import { syncOdds } from "../../lib/odds/sync";
 import { ProviderError, type OddsProvider } from "../../lib/providers/odds-provider";
 
-const connectionString = process.env.TEST_DATABASE_URL;
-if (!connectionString || !new URL(connectionString).pathname.endsWith("_test")) {
-  throw new Error("Set TEST_DATABASE_URL to a separate PostgreSQL database ending in _test. Odds tests never use DATABASE_URL.");
-}
-if (connectionString === process.env.DATABASE_URL) throw new Error("Test and application databases must be separate.");
+import { disposablePostgres } from "../helpers/postgres";
 
-const testSchema = `odds_test_${randomUUID().replaceAll("-", "")}`;
-const admin = new Pool({ connectionString, max: 1 });
-const pool = new Pool({ connectionString, max: 12, options: `-c search_path=${testSchema}` });
-const db = drizzle(pool, { schema });
-const settings = { refreshSeconds: 60, freshSeconds: 300, maxAgeSeconds: 86_400, creditReserve: 25 };
+const postgres = disposablePostgres();
+const { pool, db, queries } = postgres;
+const settings = { refreshSeconds: 60, freshSeconds: 300, maxAgeSeconds: 86_400, creditReserve: 25,
+  monthlyCreditCap: 300, dailyPaidRefreshLimit: 3, billingAnchor: null };
 const repository = oddsRepository(db, settings);
 const start = new Date("2026-11-10T12:00:00.000Z");
 const at = (seconds: number) => new Date(start.getTime() + seconds * 1000);
@@ -56,18 +46,14 @@ async function gameId(provider: ProviderName = "mock", event = "event-a") {
 }
 
 beforeAll(async () => {
-  await admin.query(`CREATE SCHEMA "${testSchema}"`);
-  await migrate(db, { migrationsFolder: "./drizzle", migrationsSchema: testSchema });
+  await postgres.initialize();
+  await postgres.captureMutations(["nfl_games", "nfl_game_provider_ids", "nfl_current_odds", "odds_sync_state"]);
 });
 beforeEach(async () => {
-  await pool.query("TRUNCATE nfl_current_odds, nfl_game_provider_ids, nfl_games, odds_sync_state");
+  await pool.query("TRUNCATE nfl_current_odds, nfl_game_provider_ids, nfl_games, odds_sync_state, test_row_mutations");
 });
 afterEach(() => { vi.restoreAllMocks(); });
-afterAll(async () => {
-  await pool.end();
-  try { await admin.query(`DROP SCHEMA IF EXISTS "${testSchema}" CASCADE`); }
-  finally { await admin.end(); }
-});
+afterAll(() => postgres.close());
 
 describe("PostgreSQL NFL odds ingestion and cache", () => {
   it("distinguishes an uninitialized cache from a successful empty snapshot", async () => {
@@ -171,7 +157,7 @@ describe("PostgreSQL NFL odds ingestion and cache", () => {
     const expired = await repository.gameOdds("mock", id, at(300));
     expect(expired.quotes.every((quote) => quote.stale)).toBe(true);
     expect(expired.meta.stale).toBe(true);
-    expect(expired.quotes[0]).toMatchObject({ providerUpdatedAt: start.toISOString(), ingestedAt: at(240).toISOString(),
+    expect(expired.quotes[0]).toMatchObject({ providerUpdatedAt: start.toISOString(), ingestedAt: start.toISOString(),
       freshUntil: at(300).toISOString(), expiresAt: at(86_400).toISOString() });
     expect((await repository.gameOdds("mock", id, at(86_400))).quotes).toEqual([]);
   });
@@ -273,9 +259,87 @@ describe("PostgreSQL NFL odds ingestion and cache", () => {
     expect(after.meta.lastSuccessAt).toBe(start.toISOString());
   });
 
-  it("deletes expired quote rows during a successful later ingestion", async () => {
+  it("retains removal tombstones for one maximum age then deletes them on demand", async () => {
     await ingest();
     await ingest({ ...snapshot(at(86_400)), quotes: [] }, at(86_400));
+    expect((await pool.query("SELECT * FROM nfl_current_odds WHERE available")).rowCount).toBe(0);
+    expect((await pool.query("SELECT * FROM nfl_current_odds")).rowCount).toBe(12);
+    await ingest({ ...snapshot(at(172_800)), quotes: [] }, at(172_800));
     expect((await pool.query("SELECT * FROM nfl_current_odds")).rowCount).toBe(0);
+  });
+
+  it("does not revive a removed quote with a timestamp between its last quote and removal", async () => {
+    await ingest();
+    await ingest({ ...snapshot(at(120)), quotes: [] }, at(120));
+    const intermediate = { ...snapshot(at(60)), fetchedAt: at(180).toISOString() };
+    await ingest(intermediate, at(180));
+    expect((await repository.gameOdds("mock", await gameId(), at(180))).quotes).toEqual([]);
+    expect((await pool.query("SELECT DISTINCT unavailable_at FROM nfl_current_odds")).rows).toEqual([{ unavailable_at: at(120) }]);
+  });
+
+  it("does not rewrite games that were already unavailable", async () => {
+    await ingest();
+    await ingest({ ...snapshot(at(60)), games: [], quotes: [] }, at(60));
+    await pool.query("TRUNCATE test_row_mutations");
+    await ingest({ ...snapshot(at(120)), games: [], quotes: [] }, at(120));
+    expect((await pool.query("SELECT * FROM test_row_mutations WHERE table_name <> 'odds_sync_state'")).rows).toEqual([]);
+  });
+
+  it("bulk writes a changed batch in a constant number of SQL statements", async () => {
+    await ingest();
+    queries.length = 0;
+    await ingest(snapshot(at(60)), at(60));
+    expect(queries.filter((query) => query.startsWith('insert into "nfl_current_odds"'))).toHaveLength(1);
+    expect(queries).toHaveLength(8);
+  });
+
+  it("measures an unchanged 32-game 384-quote refresh with zero cache row mutations", async () => {
+    const fixture = snapshot();
+    const quotes = fixture.quotes;
+    const games = Array.from({ length: 32 }, (_, index) => ({ ...fixture.games[1], providerEventId: `benchmark-${index}` }));
+    const batch = { ...fixture, games, quotes: games.flatMap((game) => quotes.map((quote) => ({ ...quote, providerEventId: game.providerEventId }))) };
+    await ingest(batch);
+    await pool.query("TRUNCATE test_row_mutations");
+    queries.length = 0;
+    await ingest({ ...batch, fetchedAt: at(60).toISOString() }, at(60));
+    const statements = queries.length;
+    const mutations = (await pool.query("SELECT table_name, operation, count(*)::integer AS count FROM test_row_mutations GROUP BY table_name, operation")).rows;
+    expect(statements).toBe(7);
+    expect(mutations).toEqual([{ table_name: "odds_sync_state", operation: "UPDATE", count: 2 }]);
+    console.info(JSON.stringify({ benchmark: "unchanged mock refresh", games: 32, quotes: 384, sqlStatements: statements, rowMutations: mutations }));
+  });
+
+  it("uses the PostgreSQL clock when no test clock is supplied", async () => {
+    const before = (await pool.query("SELECT statement_timestamp() AS now")).rows[0].now as Date;
+    const lease = (await repository.acquire("mock"))!;
+    const after = (await pool.query("SELECT statement_timestamp() AS now")).rows[0].now as Date;
+    expect(lease.now.getTime()).toBeGreaterThanOrEqual(before.getTime());
+    expect(lease.now.getTime()).toBeLessThanOrEqual(after.getTime());
+    const state = (await pool.query("SELECT next_refresh_at, lease_until FROM odds_sync_state")).rows[0];
+    expect(state.next_refresh_at.getTime() - lease.now.getTime()).toBe(60_000);
+    expect(state.lease_until.getTime() - lease.now.getTime()).toBe(120_000);
+  });
+
+  it("keeps the six-hour pacing after a crashed worker even after its lease expires", async () => {
+    const cautious = oddsRepository(db, { ...settings, refreshSeconds: 21_600 });
+    expect(await cautious.acquire("mock", start)).not.toBeNull();
+    expect(await cautious.acquire("mock", at(121))).toBeNull();
+    expect(await cautious.acquire("mock", at(21_599))).toBeNull();
+    expect(await cautious.acquire("mock", at(21_600))).not.toBeNull();
+  });
+
+  it("enforces six hours for the real provider even if a caller supplies a shorter interval", async () => {
+    await ingest(snapshot(), start, "the-odds-api");
+    expect(await repository.acquire("the-odds-api", at(60))).toBeNull();
+    expect(await repository.acquire("the-odds-api", at(21_599))).toBeNull();
+    expect(await repository.acquire("the-odds-api", at(21_600))).not.toBeNull();
+  });
+
+  it("never shortens an acquired cooldown when reporting a failure", async () => {
+    const cautious = oddsRepository(db, { ...settings, refreshSeconds: 21_600 });
+    const lease = (await cautious.acquire("mock", start))!;
+    await cautious.fail("mock", lease.token, at(10), "SYNC_UNAVAILABLE", 60);
+    expect(await cautious.acquire("mock", at(21_599))).toBeNull();
+    expect(await cautious.acquire("mock", at(21_600))).not.toBeNull();
   });
 });

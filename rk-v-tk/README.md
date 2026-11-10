@@ -34,21 +34,34 @@ profile. Cognito login usernames and profile usernames are separate. Sign-in
 behavior and the existing Cognito resources are unchanged.
 
 The NFL browser below the profile compares moneylines, spreads, and totals from
-the cached dataset. Mock games are labeled as demo data. Its refresh control reads
-the database; it never requests new sportsbook data.
+the cached dataset. Mock games are labeled as demo data. Page entry and the manual
+refresh control request a shared refresh, subject to the server's limits, then
+read the cache. There is no automatic network polling.
 
 ## Odds ingestion
 
 `ODDS_PROVIDER=mock` is the default. The mock provider needs no upstream API key,
 but normal database and Cognito setup still applies. To use the selected external
 provider, configure `ODDS_PROVIDER=the-odds-api` and a server-only `ODDS_API_KEY`
-in `.env.local`, then run `npm run odds:sync`.
+in `.env.local`. Real ingestion also requires `ODDS_BILLING_ANCHOR`: a confirmed
+UTC instant when the provider's usage credits reset. The account owner confirmed
+the first of each month at 00:00 UTC. Set
+`ODDS_BILLING_ANCHOR=2027-11-01T00:00:00Z` locally and in the Amplify server runtime;
+this fixed anchor repeats monthly and does not need monthly edits. See
+[reset configuration](../docs/ODDS_INTEGRATION.md#configuration).
 
-The sync command runs once and respects the shared database lease, retry cooldown,
-refresh interval, and credit reserve. It is not a scheduler. The six-hour default
-interval fits occasional free-tier browsing; quotes are labeled stale after five
-minutes and hidden after 24 hours or at kickoff. Running the command repeatedly
-does not bypass those protections.
+Defaults cap paid ingestion at **300 credits per configured monthly period**,
+**three paid attempts per Eastern calendar day**, and **at least six hours between
+paid attempts**, including failed requests. Each paid call reserves three credits
+atomically in PostgreSQL; ambiguous failures keep that reservation. All app
+instances and CLI invocations using this allocation must share the same database.
+Separate databases using the same API key cannot coordinate these limits.
+
+`npm run odds:sync` runs once and obeys the same lease, budgets, cooldown, and
+upstream credit reserve as the browser's authenticated refresh request. No
+scheduler or idle ingestion runs. Quotes are labeled stale after five minutes and
+hidden after 24 hours or at kickoff; the cost controls intentionally permit stale
+display data between refreshes. This milestone does not accept wagers.
 
 See [odds setup and architecture](../docs/ODDS_INTEGRATION.md) for configuration,
 current-cache semantics, local mocks, and operating the sync command. Provider
@@ -93,12 +106,13 @@ Unit/API tests need no credentials. Token tests use real RSA signatures with loc
 test keys; only JWKS retrieval is stubbed. The production build needs no database
 or Cognito credentials. The existing Google Fonts setup requires network access.
 
-Integration tests use real PostgreSQL and the committed migration in an isolated
-temporary schema. They cover persistence across connections, uniqueness,
+Integration tests use real PostgreSQL and the committed migrations in isolated
+temporary databases. They cover persistence across connections, uniqueness,
 concurrent registration, account isolation, migration replay, and odds ingestion/
 cache behavior. Provider tests use fixtures and mocked HTTP, never live odds.
-Integration tests fail
-explicitly without `TEST_DATABASE_URL`, never fall back to `DATABASE_URL`, and
+Budget tests cover concurrent reservations, daily/monthly boundaries, and failed
+paid attempts. Integration tests fail explicitly without `TEST_DATABASE_URL`,
+never fall back to `DATABASE_URL`, and
 never silently skip coverage. For example, with Docker running:
 
 ```sh
@@ -111,8 +125,8 @@ docker stop rkvtk-profile-test
 ```
 
 An existing disposable PostgreSQL instance also works. The database name must end
-in `_test`, and the account needs create/drop schema permission. Tests clean up
-only their generated schema. Run integration tests before merging database changes.
+in `_test`, and the account needs permission to create/drop test databases. Tests
+clean up only their generated databases. Run integration tests before merging database changes.
 
 ## Amplify Hosting
 
@@ -120,6 +134,9 @@ See [database and Amplify setup](../docs/DATABASE_SETUP.md) for `WEB_COMPUTE`
 runtime configuration, secret handling, migration sequencing, and rollback.
 Existing deployment settings are preserved. No AWS or Neon resources are created.
 The odds sync command also needs server-side environment configuration wherever
-it runs. Automated production refresh requires a separately configured scheduler;
-it is not performed by Amplify SSR requests or the browser.
+it runs. The existing `amplify:env` allowlist includes the server-only provider
+key, quota-reset anchor, and limits. Authenticated page-entry/manual refreshes
+use the same ingestion service as the CLI; GET endpoints only read cached data.
+No scheduler, Redis, or new AWS resources are introduced. Existing hosting and
+database requests can still incur charges under their configured plans.
 See [API contracts](../docs/API_CONTRACTS.md) for response and error behavior.

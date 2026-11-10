@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { americanToDecimal, nflSeasonYear } from "../../lib/domain/odds";
 import { NFL_TEAMS, resolveTeam } from "../../lib/domain/nfl-teams";
-import { configuredProviderName, createOddsProvider } from "../../lib/providers/odds-provider";
+import { configuredProviderName, createOddsProvider, type PaidRequestGuard } from "../../lib/providers/odds-provider";
 import { MockOddsProvider } from "../../lib/providers/mock-odds-provider";
 import { normalizeTheOddsApiResponse, TheOddsApiProvider } from "../../lib/providers/the-odds-api";
 
@@ -27,6 +27,10 @@ function oddsEvent() {
 }
 const headers = { "x-requests-remaining": "400", "x-requests-used": "100", "x-requests-last": "3" };
 const response = (data: unknown, customHeaders: Record<string, string> = headers) => Response.json(data, { headers: customHeaders });
+const paidGuard = (): PaidRequestGuard => ({
+  beforePaidRequest: vi.fn().mockResolvedValue(undefined),
+  afterPaidResponse: vi.fn().mockResolvedValue(undefined),
+});
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
 describe("odds domain", () => {
@@ -176,11 +180,83 @@ describe("The Odds API normalization", () => {
 });
 
 describe("The Odds API transport and quota guards", () => {
+  it("refuses a paid call without a durable guard", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response([game]));
+    await expect(new TheOddsApiProvider({ apiKey: "test-key", fetchImpl }).fetchSnapshot(now))
+      .rejects.toMatchObject({ code: "PROVIDER_CONFIGURATION" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+  it("waits for a committed reservation before sending the paid request", async () => {
+    const calls: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+      const paid = String(url).includes("/odds?");
+      calls.push(paid ? "paid" : "free");
+      return response(paid ? [oddsEvent()] : [game]);
+    });
+    const guard = {
+      beforePaidRequest: vi.fn(async () => { calls.push("reserved"); }),
+      afterPaidResponse: vi.fn(async () => { calls.push("confirmed"); }),
+    };
+    await new TheOddsApiProvider({ apiKey: "test-key", fetchImpl }).fetchSnapshot(now, guard);
+    expect(calls).toEqual(["free", "reserved", "paid", "confirmed"]);
+    expect(guard.beforePaidRequest).toHaveBeenCalledExactlyOnceWith({ remaining: 400, used: 100, lastCost: 3 });
+    expect(guard.afterPaidResponse).toHaveBeenCalledExactlyOnceWith({ remaining: 400, used: 100, lastCost: 3 });
+  });
+  it("does not send a paid request when reservation is denied or uncertain", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response([game]));
+    const guard = paidGuard();
+    guard.beforePaidRequest = vi.fn().mockRejectedValue(new Error("reservation unavailable"));
+    await expect(new TheOddsApiProvider({ apiKey: "test-key", fetchImpl }).fetchSnapshot(now, guard)).rejects.toThrow();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(guard.afterPaidResponse).not.toHaveBeenCalled();
+  });
+  it.each(["network", "timeout", "429", "503", "json", "normalization"])(
+    "keeps a failed %s paid request ambiguous without retrying", async (failure) => {
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(response([game]));
+      if (failure === "network") fetchImpl.mockRejectedValueOnce(new Error("uncertain connection"));
+      else if (failure === "timeout") fetchImpl.mockImplementationOnce((_url, options) => new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () => reject(new Error("timeout")));
+      }));
+      else if (failure === "429" || failure === "503") fetchImpl.mockResolvedValueOnce(new Response(null, { status: Number(failure) }));
+      else if (failure === "json") fetchImpl.mockResolvedValueOnce(new Response("invalid JSON", { headers }));
+      else fetchImpl.mockResolvedValueOnce(response({ invalid: "shape" }));
+      const guard = paidGuard();
+      await expect(new TheOddsApiProvider({ apiKey: "test-key", fetchImpl, timeoutMs: 5 }).fetchSnapshot(now, guard)).rejects.toThrow();
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      expect(guard.beforePaidRequest).toHaveBeenCalledTimes(1);
+      expect(guard.afterPaidResponse).not.toHaveBeenCalled();
+    },
+  );
+  it.each(["0", "1", "3"])("confirms a valid receipt costing %s credits", async (cost) => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(response([game]))
+      .mockResolvedValueOnce(response([oddsEvent()], { ...headers, "x-requests-last": cost }));
+    const guard = paidGuard();
+    await new TheOddsApiProvider({ apiKey: "test-key", fetchImpl }).fetchSnapshot(now, guard);
+    expect(guard.afterPaidResponse).toHaveBeenCalledExactlyOnceWith({ remaining: 400, used: 100, lastCost: Number(cost) });
+  });
+  it.each(["", "NaN", "-1", "4"])("retains the reservation when the paid receipt is invalid (%s)", async (cost) => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(response([game]))
+      .mockResolvedValueOnce(response([oddsEvent()], { ...headers, "x-requests-last": cost }));
+    const guard = paidGuard();
+    const snapshot = await new TheOddsApiProvider({ apiKey: "test-key", fetchImpl }).fetchSnapshot(now, guard);
+    expect(snapshot.quotes).toHaveLength(10);
+    expect(guard.beforePaidRequest).toHaveBeenCalledTimes(1);
+    expect(guard.afterPaidResponse).not.toHaveBeenCalled();
+  });
+  it("does not repeat the paid call when receipt persistence fails", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(response([game]))
+      .mockResolvedValueOnce(response([oddsEvent()]));
+    const guard = paidGuard();
+    guard.afterPaidResponse = vi.fn().mockRejectedValue(new Error("database unavailable"));
+    await expect(new TheOddsApiProvider({ apiKey: "test-key", fetchImpl }).fetchSnapshot(now, guard)).rejects.toThrow();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(guard.beforePaidRequest).toHaveBeenCalledTimes(1);
+  });
   it("makes a free quota check then one batch odds request with only permitted parameters", async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(response([game]))
       .mockResolvedValueOnce(response([oddsEvent()]));
     const provider = new TheOddsApiProvider({ apiKey: "test-key", fetchImpl });
-    const result = await provider.fetchSnapshot(now);
+    const result = await provider.fetchSnapshot(now, paidGuard());
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     const url = new URL(String(fetchImpl.mock.calls[1][0]));
     expect(url.pathname).toBe("/v4/sports/americanfootball_nfl/odds");
@@ -195,7 +271,7 @@ describe("The Odds API transport and quota guards", () => {
   it.each(["27", "0"])("does not spend credits when remaining is %s", async (remaining) => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response([game], { ...headers, "x-requests-remaining": remaining }));
     const provider = new TheOddsApiProvider({ apiKey: "test-key", fetchImpl });
-    await expect(provider.fetchSnapshot(now)).rejects.toMatchObject({ code: "PROVIDER_QUOTA_EXHAUSTED" });
+    await expect(provider.fetchSnapshot(now, paidGuard())).rejects.toMatchObject({ code: "PROVIDER_QUOTA_EXHAUSTED" });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
   it("allows the exact reserve boundary and rereads quota after a reset", async () => {
@@ -204,13 +280,13 @@ describe("The Odds API transport and quota guards", () => {
       .mockResolvedValueOnce(response([game], { ...headers, "x-requests-remaining": "28" }))
       .mockResolvedValueOnce(response([oddsEvent()], { ...headers, "x-requests-remaining": "25" }));
     const provider = new TheOddsApiProvider({ apiKey: "test-key", fetchImpl });
-    await expect(provider.fetchSnapshot(now)).rejects.toMatchObject({ code: "PROVIDER_QUOTA_EXHAUSTED" });
-    expect((await provider.fetchSnapshot(now)).quota.remaining).toBe(25);
+    await expect(provider.fetchSnapshot(now, paidGuard())).rejects.toMatchObject({ code: "PROVIDER_QUOTA_EXHAUSTED" });
+    expect((await provider.fetchSnapshot(now, paidGuard())).quota.remaining).toBe(25);
     expect(fetchImpl).toHaveBeenCalledTimes(3);
   });
   it.each([{}, { "x-requests-remaining": "NaN" }] as Record<string, string>[])("fails closed when quota is missing or invalid", async (customHeaders) => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(response([game], customHeaders));
-    await expect(new TheOddsApiProvider({ apiKey: "test-key", fetchImpl }).fetchSnapshot(now))
+    await expect(new TheOddsApiProvider({ apiKey: "test-key", fetchImpl }).fetchSnapshot(now, paidGuard()))
       .rejects.toMatchObject({ code: "PROVIDER_INVALID_RESPONSE" });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
@@ -218,7 +294,7 @@ describe("The Odds API transport and quota guards", () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response("secret upstream text", {
       status: 429, headers: { "Retry-After": "120" },
     }));
-    await expect(new TheOddsApiProvider({ apiKey: "secret-key", fetchImpl }).fetchSnapshot(now))
+    await expect(new TheOddsApiProvider({ apiKey: "secret-key", fetchImpl }).fetchSnapshot(now, paidGuard()))
       .rejects.toMatchObject({ code: "PROVIDER_RATE_LIMITED", retryAfterSeconds: 120, message: "PROVIDER_RATE_LIMITED" });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
@@ -226,29 +302,29 @@ describe("The Odds API transport and quota guards", () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, {
       status: 429, headers: { "Retry-After": "Tue, 10 Nov 2026 12:02:00 GMT" },
     }));
-    await expect(new TheOddsApiProvider({ apiKey: "test-key", fetchImpl }).fetchSnapshot(now))
+    await expect(new TheOddsApiProvider({ apiKey: "test-key", fetchImpl }).fetchSnapshot(now, paidGuard()))
       .rejects.toMatchObject({ retryAfterSeconds: 120 });
   });
   it("sanitizes network and upstream errors", async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockRejectedValueOnce(new Error("https://upstream?apiKey=secret"))
       .mockResolvedValueOnce(new Response("secret upstream body", { status: 503 }));
     const provider = new TheOddsApiProvider({ apiKey: "test-key", fetchImpl });
-    await expect(provider.fetchSnapshot(now)).rejects.toMatchObject({ code: "PROVIDER_UNAVAILABLE", message: "PROVIDER_UNAVAILABLE" });
-    await expect(provider.fetchSnapshot(now)).rejects.toMatchObject({ code: "PROVIDER_UNAVAILABLE" });
+    await expect(provider.fetchSnapshot(now, paidGuard())).rejects.toMatchObject({ code: "PROVIDER_UNAVAILABLE", message: "PROVIDER_UNAVAILABLE" });
+    await expect(provider.fetchSnapshot(now, paidGuard())).rejects.toMatchObject({ code: "PROVIDER_UNAVAILABLE" });
   });
   it("aborts a timed-out request", async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockImplementation((_url, options) => new Promise((_resolve, reject) => {
       options?.signal?.addEventListener("abort", () => reject(new Error("request aborted")));
     }));
-    await expect(new TheOddsApiProvider({ apiKey: "test-key", fetchImpl, timeoutMs: 5 }).fetchSnapshot(now))
+    await expect(new TheOddsApiProvider({ apiKey: "test-key", fetchImpl, timeoutMs: 5 }).fetchSnapshot(now, paidGuard()))
       .rejects.toMatchObject({ code: "PROVIDER_UNAVAILABLE" });
   });
   it("rejects malformed JSON and oversized bodies", async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response("not json"))
       .mockResolvedValueOnce(new Response("[]", { headers: { "content-length": "2000001" } }));
     const provider = new TheOddsApiProvider({ apiKey: "test-key", fetchImpl });
-    await expect(provider.fetchSnapshot(now)).rejects.toMatchObject({ code: "PROVIDER_INVALID_RESPONSE" });
-    await expect(provider.fetchSnapshot(now)).rejects.toMatchObject({ code: "PROVIDER_INVALID_RESPONSE" });
+    await expect(provider.fetchSnapshot(now, paidGuard())).rejects.toMatchObject({ code: "PROVIDER_INVALID_RESPONSE" });
+    await expect(provider.fetchSnapshot(now, paidGuard())).rejects.toMatchObject({ code: "PROVIDER_INVALID_RESPONSE" });
   });
 });
 
@@ -257,9 +333,9 @@ describe("empty schedule protection", () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(response([]))
       .mockResolvedValueOnce(response([{}]));
     const provider = new TheOddsApiProvider({ apiKey: "test-key", fetchImpl });
-    expect((await provider.fetchSnapshot(now)).games).toEqual([]);
+    expect((await provider.fetchSnapshot(now, paidGuard())).games).toEqual([]);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
-    await expect(provider.fetchSnapshot(now)).rejects.toMatchObject({ code: "PROVIDER_INVALID_RESPONSE" });
+    await expect(provider.fetchSnapshot(now, paidGuard())).rejects.toMatchObject({ code: "PROVIDER_INVALID_RESPONSE" });
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 });

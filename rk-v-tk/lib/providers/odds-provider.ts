@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { ProviderName, ProviderSnapshot } from "../domain/odds";
+import type { ProviderName, ProviderQuota, ProviderSnapshot } from "../domain/odds";
 import { MockOddsProvider } from "./mock-odds-provider";
 import { TheOddsApiProvider } from "./the-odds-api";
 import { ProviderError } from "./provider-error";
@@ -8,9 +8,16 @@ import { ProviderError } from "./provider-error";
 export { ProviderError } from "./provider-error";
 export type { ProviderErrorCode } from "./provider-error";
 
+export interface PaidRequestGuard {
+  /** Commit a durable reservation before any paid HTTP request is sent. */
+  beforePaidRequest(quota: ProviderQuota): Promise<void>;
+  /** Record a confirmed response; absent/invalid receipts stay conservatively charged. */
+  afterPaidResponse(quota: ProviderQuota): Promise<void>;
+}
+
 export interface OddsProvider {
   readonly name: ProviderName;
-  fetchSnapshot(now: Date): Promise<ProviderSnapshot>;
+  fetchSnapshot(now: Date, guard?: PaidRequestGuard): Promise<ProviderSnapshot>;
 }
 
 export function configuredProviderName(): ProviderName {

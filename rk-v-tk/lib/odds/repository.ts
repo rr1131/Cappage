@@ -1,7 +1,7 @@
 import "server-only";
 
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, gt, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, gt, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import type { PgDatabase, PgQueryResultHKT } from "drizzle-orm/pg-core";
 import * as schema from "../db/schema";
 import { nflGames as games, nflGameProviderIds as mappings, nflCurrentOdds as odds, oddsSyncState as sync } from "../db/schema";
@@ -10,6 +10,7 @@ import { NFL_TEAMS } from "../domain/nfl-teams";
 import { easternWindowEnd } from "../domain/odds-window";
 import { OddsError } from "./errors";
 import type { OddsSettings } from "./settings";
+import { creditBudget } from "./credit-budget";
 
 type Database = PgDatabase<PgQueryResultHKT, typeof schema>;
 type GameRow = typeof games.$inferSelect;
@@ -78,65 +79,95 @@ export function oddsRepository(db: Database, settings: OddsSettings) {
     return { game: serializeGame(row.game), quotes, markets, meta: { ...meta, stale: meta.stale || quotes.some((q) => q.stale) } };
   }
 
-  async function acquire(provider: ProviderName, now: Date) {
-    await db.insert(sync).values({ provider }).onConflictDoNothing();
+  // Explicit times are an integration-test seam. Production callers use the
+  // shared PostgreSQL clock, so Amplify instance clock skew cannot bypass pacing.
+  const refreshInterval = (provider: ProviderName) => provider === "the-odds-api" ? Math.max(21_600, settings.refreshSeconds) : settings.refreshSeconds;
+  const databaseNow = (now?: Date) => now ? sql`${now.toISOString()}::timestamptz` : sql`statement_timestamp()`;
+
+  async function acquire(provider: ProviderName, now?: Date) {
+    const time = databaseNow(now);
     const token = randomUUID();
-    const [state] = await db.update(sync).set({ leaseToken: token, leaseUntil: new Date(now.getTime() + 120_000), lastAttemptAt: now })
-      .where(and(eq(sync.provider, provider), or(isNull(sync.leaseUntil), lte(sync.leaseUntil, now)),
-        or(isNull(sync.nextRefreshAt), lte(sync.nextRefreshAt, now)))).returning();
-    return state ? { token, failures: state.failures } : null;
+    const values = { leaseToken: token, leaseUntil: sql`${time} + interval '120 seconds'`, lastAttemptAt: time,
+      nextRefreshAt: sql`${time} + ${refreshInterval(provider)} * interval '1 second'` };
+    const [state] = await db.insert(sync).values({ provider, ...values }).onConflictDoUpdate({
+      target: sync.provider,
+      set: values,
+      setWhere: and(or(isNull(sync.leaseUntil), lte(sync.leaseUntil, time)),
+        or(isNull(sync.nextRefreshAt), lte(sync.nextRefreshAt, time)),
+        or(isNull(sync.lastSuccessAt), lte(sync.lastSuccessAt, sql`${time} - ${refreshInterval(provider)} * interval '1 second'`))),
+    }).returning();
+    return state ? { token, failures: state.failures, now: state.lastAttemptAt! } : null;
   }
 
-  async function fail(provider: ProviderName, token: string, now: Date, code: string, delaySeconds: number) {
+  async function fail(provider: ProviderName, token: string, now: Date | undefined, code: string, delaySeconds: number) {
     await db.update(sync).set({ leaseToken: null, leaseUntil: null, lastError: code,
-      failures: sql`${sync.failures} + 1`, nextRefreshAt: new Date(now.getTime() + milliseconds(delaySeconds)) })
+      failures: sql`${sync.failures} + 1`,
+      nextRefreshAt: sql`greatest(${sync.nextRefreshAt}, ${databaseNow(now)} + ${delaySeconds} * interval '1 second')` })
       .where(and(eq(sync.provider, provider), eq(sync.leaseToken, token)));
   }
 
-  async function save(provider: ProviderName, token: string, snapshot: ProviderSnapshot, now: Date) {
+  async function save(provider: ProviderName, token: string, snapshot: ProviderSnapshot, suppliedNow?: Date) {
     return db.transaction(async (tx) => {
-      const [state] = await tx.select().from(sync).where(eq(sync.provider, provider)).for("update");
-      if (!state || state.leaseToken !== token || !state.leaseUntil || state.leaseUntil <= now) {
+      const [state] = await tx.select({ ...getTableColumns(sync),
+        databaseNow: sql<string>`${databaseNow(suppliedNow)}::text`,
+      }).from(sync).where(eq(sync.provider, provider)).for("update");
+      const now = state && new Date(state.databaseNow);
+      if (!state || !now || state.leaseToken !== token || !state.leaseUntil || state.leaseUntil <= now) {
         throw new OddsError("SYNC_LEASE_LOST", "The sync lease has expired or was replaced.", 409);
       }
       const snapshotAt = new Date(snapshot.fetchedAt);
       if (!Number.isFinite(snapshotAt.getTime()) || snapshotAt > now || (state.snapshotAt && snapshotAt < state.snapshotAt)) {
         throw new OddsError("STALE_SNAPSHOT", "Ignoring an out-of-order snapshot.", 409);
       }
-      const existingMappings = await tx.select().from(mappings).where(eq(mappings.provider, provider));
-      const byProviderId = new Map(existingMappings.map((m) => [m.providerEventId, m.gameId]));
+      // Historical unavailable games need neither a read nor another UPDATE on
+      // each refresh. Incoming IDs still find their stable application UUID.
+      const incomingIds = [...new Set(snapshot.games.map((game) => game.providerEventId))];
+      const existingGames = await tx.select({ mapping: mappings, game: games }).from(mappings)
+        .innerJoin(games, eq(games.id, mappings.gameId)).where(and(eq(mappings.provider, provider),
+          or(eq(games.status, "scheduled"), incomingIds.length ? inArray(mappings.providerEventId, incomingIds) : undefined)));
+      const byProviderId = new Map(existingGames.map((row) => [row.mapping.providerEventId, row.game]));
       const gameIds = new Map<string, string>();
+      const gameWrites: (typeof games.$inferInsert)[] = [];
+      const mappingWrites: (typeof mappings.$inferInsert)[] = [];
       for (const game of snapshot.games) {
-        if (gameIds.has(game.providerEventId)) continue;
-        if (!NFL_TEAMS[game.homeTeamId] || !NFL_TEAMS[game.awayTeamId] || game.homeTeamId === game.awayTeamId) {
+        if (!Object.hasOwn(NFL_TEAMS, game.homeTeamId) || !Object.hasOwn(NFL_TEAMS, game.awayTeamId) || game.homeTeamId === game.awayTeamId) {
           throw new OddsError("INVALID_SNAPSHOT", "Invalid event identity.", 503);
         }
+        const duplicate = gameIds.get(game.providerEventId);
+        if (duplicate) continue;
         const startsAt = new Date(game.startsAt);
         if (!Number.isFinite(startsAt.getTime())) throw new OddsError("INVALID_SNAPSHOT", "Invalid event time.", 503);
         if (startsAt <= now) continue;
-        const values = { homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, startsAt,
-          status: "scheduled" as const, seasonYear: game.seasonYear, seasonSource: game.seasonSource, lastSeenAt: now, updatedAt: now };
-        let id = byProviderId.get(game.providerEventId);
-        if (id) {
-          const [existing] = await tx.select().from(games).where(eq(games.id, id));
-          if (existing.homeTeamId !== game.homeTeamId || existing.awayTeamId !== game.awayTeamId) {
-            throw new OddsError("INVALID_SNAPSHOT", "Provider changed an event's team identities.", 503);
-          }
-          await tx.update(games).set(values).where(eq(games.id, id));
-        } else {
-          const [created] = await tx.insert(games).values(values).returning({ id: games.id });
-          id = created.id;
-          await tx.insert(mappings).values({ provider, providerEventId: game.providerEventId, gameId: id });
+        const existing = byProviderId.get(game.providerEventId);
+        if (existing && (existing.homeTeamId !== game.homeTeamId || existing.awayTeamId !== game.awayTeamId)) {
+          throw new OddsError("INVALID_SNAPSHOT", "Provider changed an event's team identities.", 503);
         }
+        const id = existing?.id ?? randomUUID();
         gameIds.set(game.providerEventId, id);
+        if (!existing || existing.startsAt.getTime() !== startsAt.getTime() || existing.status !== "scheduled"
+          || existing.seasonYear !== game.seasonYear || existing.seasonSource !== game.seasonSource) {
+          gameWrites.push({ id, homeTeamId: game.homeTeamId, awayTeamId: game.awayTeamId, startsAt,
+            status: "scheduled", seasonYear: game.seasonYear, seasonSource: game.seasonSource, lastSeenAt: now, updatedAt: now });
+        }
+        if (!existing) mappingWrites.push({ provider, providerEventId: game.providerEventId, gameId: id });
       }
-      const missing = existingMappings.filter((m) => !gameIds.has(m.providerEventId)).map((m) => m.gameId);
-      if (missing.length) await tx.update(games).set({ status: "unavailable", updatedAt: now }).where(inArray(games.id, missing));
+      if (gameWrites.length) await tx.insert(games).values(gameWrites).onConflictDoUpdate({ target: games.id,
+        set: { startsAt: sql`excluded.starts_at`, status: sql`excluded.status`, seasonYear: sql`excluded.season_year`,
+          seasonSource: sql`excluded.season_source`, lastSeenAt: sql`excluded.last_seen_at`, updatedAt: sql`excluded.updated_at` },
+        setWhere: sql`(${games.startsAt}, ${games.status}, ${games.seasonYear}, ${games.seasonSource})
+          IS DISTINCT FROM (excluded.starts_at, excluded.status, excluded.season_year, excluded.season_source)`,
+      });
+      if (mappingWrites.length) await tx.insert(mappings).values(mappingWrites).onConflictDoNothing();
+      const missingGames = existingGames.filter(({ mapping, game }) => game.status === "scheduled" && !gameIds.has(mapping.providerEventId))
+        .map(({ game }) => game.id);
+      if (missingGames.length) await tx.update(games).set({ status: "unavailable", updatedAt: now })
+        .where(and(inArray(games.id, missingGames), eq(games.status, "scheduled")));
 
       const existingOdds = await tx.select().from(odds).where(eq(odds.provider, provider));
       const bySlot = new Map(existingOdds.map((q) => [slot(q), q]));
-      const seen = new Set<string>();
       const observedSlots = new Set<string>();
+      const quoteWrites: (typeof odds.$inferInsert)[] = [];
+      const cutoff = new Date(now.getTime() - milliseconds(settings.maxAgeSeconds));
       for (const quote of snapshot.quotes) {
         const gameId = gameIds.get(quote.providerEventId);
         if (!gameId) continue;
@@ -146,32 +177,43 @@ export function oddsRepository(db: Database, settings: OddsSettings) {
         const old = bySlot.get(key);
         const providerUpdatedAt = new Date(quote.providerUpdatedAt);
         if (!Number.isFinite(providerUpdatedAt.getTime()) || providerUpdatedAt > now) throw new OddsError("INVALID_SNAPSHOT", "Invalid quote timestamp.", 503);
-        if (old) {
-          seen.add(old.id);
-          const changed = old.americanOdds !== quote.americanOdds || old.point !== quote.point || !old.available;
-          // An old provider timestamp must neither change the price nor revive a
-          // removed market. Equal, identical observations may renew ingestion age.
-          if (providerUpdatedAt < old.providerUpdatedAt || (changed && providerUpdatedAt <= old.providerUpdatedAt)) continue;
-          await tx.update(odds).set({ point: quote.point, americanOdds: quote.americanOdds, providerUpdatedAt,
-            ingestedAt: now, available: true, revision: changed ? old.revision + 1 : old.revision }).where(eq(odds.id, old.id));
-        } else {
-          const [created] = await tx.insert(odds).values({ provider, gameId, bookmaker: quote.bookmaker,
-            market: quote.market, selection: quote.selection, point: quote.point, americanOdds: quote.americanOdds,
-            providerUpdatedAt, ingestedAt: now }).returning({ id: odds.id });
-          seen.add(created.id);
-        }
+        // The provider timestamp already bounds freshness: repeatedly observing
+        // the identical quote must not churn its row or extend its lifetime.
+        if (providerUpdatedAt <= cutoff || (old && (providerUpdatedAt <= old.providerUpdatedAt
+          || (old.unavailableAt && providerUpdatedAt <= old.unavailableAt)))) continue;
+        const changed = old && (old.americanOdds !== quote.americanOdds || old.point !== quote.point || !old.available);
+        quoteWrites.push({ id: old?.id ?? randomUUID(), provider, gameId, bookmaker: quote.bookmaker,
+          market: quote.market, selection: quote.selection, point: quote.point, americanOdds: quote.americanOdds,
+          providerUpdatedAt, ingestedAt: now, available: true, unavailableAt: null,
+          revision: old ? old.revision + (changed ? 1 : 0) : 1 });
       }
-      await tx.update(odds).set({ available: false, revision: sql`${odds.revision} + 1` }).where(and(
-        eq(odds.provider, provider), eq(odds.available, true), seen.size ? notInArray(odds.id, [...seen]) : undefined));
-      const cutoff = new Date(now.getTime() - milliseconds(settings.maxAgeSeconds));
-      await tx.delete(odds).where(and(eq(odds.provider, provider), or(lte(odds.providerUpdatedAt, cutoff), lte(odds.ingestedAt, cutoff))));
+      if (quoteWrites.length) await tx.insert(odds).values(quoteWrites).onConflictDoUpdate({
+        target: [odds.provider, odds.gameId, odds.bookmaker, odds.market, odds.selection],
+        set: { point: sql`excluded.point`, americanOdds: sql`excluded.american_odds`,
+          providerUpdatedAt: sql`excluded.provider_updated_at`, ingestedAt: sql`excluded.ingested_at`,
+          available: true, unavailableAt: null, revision: sql`excluded.revision` },
+        setWhere: and(lt(odds.providerUpdatedAt, sql`excluded.provider_updated_at`),
+          or(isNull(odds.unavailableAt), lt(odds.unavailableAt, sql`excluded.provider_updated_at`))),
+      });
+      const missingQuotes = existingOdds.filter((quote) => quote.available && !observedSlots.has(slot(quote))).map((quote) => quote.id);
+      if (missingQuotes.length) await tx.update(odds).set({ available: false, unavailableAt: now, revision: sql`${odds.revision} + 1` })
+        .where(and(eq(odds.provider, provider), eq(odds.available, true), inArray(odds.id, missingQuotes)));
+      // Avoid a DELETE round trip when no rows can have expired. Never delete a
+      // quote refreshed in this transaction using its prior timestamp.
+      const written = new Set(quoteWrites.map((quote) => quote.id));
+      const removed = new Set(missingQuotes);
+      const expired = existingOdds.filter((quote) => !written.has(quote.id) && !removed.has(quote.id)
+        && (quote.available ? (quote.providerUpdatedAt <= cutoff || quote.ingestedAt <= cutoff)
+          : (quote.unavailableAt ?? quote.ingestedAt) <= cutoff)).map((quote) => quote.id);
+      if (expired.length) await tx.delete(odds).where(and(eq(odds.provider, provider), inArray(odds.id, expired)));
       await tx.update(sync).set({ leaseToken: null, leaseUntil: null, lastSuccessAt: now, snapshotAt,
-        nextRefreshAt: new Date(now.getTime() + milliseconds(settings.refreshSeconds)), failures: 0, lastError: null,
+        nextRefreshAt: new Date(now.getTime() + milliseconds(refreshInterval(provider))), failures: 0, lastError: null,
         quotaRemaining: snapshot.quota.remaining, quotaUsed: snapshot.quota.used, quotaLastCost: snapshot.quota.lastCost,
         warningsCount: snapshot.warnings.length }).where(eq(sync.provider, provider));
       return { games: gameIds.size, quotes: observedSlots.size, warnings: snapshot.warnings.length };
     });
   }
 
-  return { listGames, gameOdds, acquire, fail, save };
+  const budget = creditBudget(db, settings);
+  return { listGames, gameOdds, acquire, fail, save, reservePaidRequest: budget.reserve, confirmPaidRequest: budget.confirm };
 }
