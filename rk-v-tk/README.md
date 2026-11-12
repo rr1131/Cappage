@@ -132,6 +132,26 @@ clean up only their generated databases. Run integration tests before merging da
 
 See [database and Amplify setup](../docs/DATABASE_SETUP.md) for `WEB_COMPUTE`
 runtime configuration, secret handling, migration sequencing, and rollback.
+
+Keep the committed lockfile compatible with Node 22/npm 10 as well as local
+macOS installs. npm 10 requires a separate esbuild `0.28.2` installation for
+Vitest's nested Vite optional peer; the lockfile includes all 26 platform packages
+at that location, including `@esbuild/linux-x64`. Having them only under `tsx`
+can pass local npm 11 installation but fail npm 10's `npm ci` validation.
+To repair lock metadata, copy `package.json` and the existing `package-lock.json`
+to a temporary directory without `node_modules`, then run:
+
+```sh
+npm exec --yes --package=npm@10.9.4 -- npm install --package-lock-only --include=optional --ignore-scripts --no-audit --no-fund
+```
+
+Review the diff before copying the repaired lockfile back; preserve existing
+versions and platform metadata. Do not delete the lockfile or upgrade packages
+to repair missing platform entries. Validate with a clean Linux x64 `npm ci`
+and `npm run build`. Amplify's existing `npm ci` command needs no change.
+The repaired lockfile was verified in a fresh Linux x64 container with Node
+22.23.5/npm 10.9.9: the original lockfile failed with missing esbuild entries,
+and the repaired lockfile completed `npm ci` with install scripts enabled.
 Existing deployment settings are preserved. No AWS or Neon resources are created.
 The odds sync command also needs server-side environment configuration wherever
 it runs. The existing `amplify:env` allowlist includes the server-only provider
